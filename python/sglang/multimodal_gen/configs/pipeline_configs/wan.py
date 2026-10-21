@@ -455,6 +455,9 @@ def register():
         WanT2V_1_3B_SamplingParams,
         WanT2V_14B_SamplingParams,
     )
+    from sglang.multimodal_gen.configs.sample.wan import (
+        SelfForcingWanT2V480PConfig as SelfForcingWanT2V480P_SamplingParams,
+    )
     from sglang.multimodal_gen.registry import register_configs
 
     register_configs(
@@ -464,6 +467,13 @@ def register():
             "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         ],
         model_detectors=[lambda hf_id: "wanpipeline" in hf_id.lower()],
+    )
+    # Causal Self-Forcing runs the Wan 1.3B transformer through the causal DMD
+    # pipeline; select it from the pipeline class name in model_index.json.
+    register_configs(
+        sampling_param_cls=SelfForcingWanT2V480P_SamplingParams,
+        pipeline_config_cls=SelfForcingWanT2V480PConfig,
+        model_detectors=[lambda name: "wancausaldmdpipeline" in name.lower()],
     )
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
