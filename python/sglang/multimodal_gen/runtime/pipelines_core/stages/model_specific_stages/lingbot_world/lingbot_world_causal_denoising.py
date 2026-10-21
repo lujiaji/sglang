@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.kvcache.qvg_packed_cache import (
     QVGPackedCausalKVCache,
 )
+from sglang.multimodal_gen.runtime.layers.kvcache.varq_packed_cache import (
+    VARQPackedCausalKVCache,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
@@ -55,6 +58,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     def _supports_qvg_kv_cache_quantization(self) -> bool:
         return True
 
+    def _supports_varq_kv_cache_quantization(self) -> bool:
+        return True
+
     def _allocate_causal_kv_cache(
         self,
         *,
@@ -70,7 +76,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         attention_window_size: int | None = None,
         allow_growth: bool = False,
     ) -> list[CausalKVCache]:
-        if not self._kv_quant_args.enabled:
+        varq_args = getattr(self, "_varq_quant_args", None)
+        varq_enabled = varq_args is not None and varq_args.enabled
+        if not self._kv_quant_args.enabled and not varq_enabled:
             return super()._allocate_causal_kv_cache(
                 batch_size=batch_size,
                 kv_cache_size=kv_cache_size,
@@ -86,11 +94,31 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             )
         if global_sink_tokens or allow_growth:
             raise NotImplementedError(
-                "QVG packed KV cache supports only the LingBot realtime "
+                "packed KV cache supports only the LingBot realtime "
                 "sliding-window and sink path"
             )
         if attention_window_size is None:
             attention_window_size = kv_cache_size
+        if varq_enabled:
+            assert varq_args is not None  # narrowed by varq_enabled
+            varq_caches: list[CausalKVCache] = [
+                VARQPackedCausalKVCache(
+                    batch_size=batch_size,
+                    cache_size=kv_cache_size,
+                    num_heads=num_attention_heads,
+                    head_dim=attention_head_dim,
+                    dtype=dtype,
+                    device=device,
+                    use_int_indices=use_int_indices,
+                    global_end_index=torch.zeros(1, dtype=torch.long, device=device),
+                    local_end_index=torch.zeros(1, dtype=torch.long, device=device),
+                    sink_tokens=sink_tokens,
+                    attention_window_size=attention_window_size,
+                    quant_args=varq_args,
+                )
+                for _ in range(self.num_transformer_blocks)
+            ]
+            return varq_caches
         return [
             QVGPackedCausalKVCache(
                 batch_size=batch_size,
@@ -242,6 +270,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         self._reset_causal_cache_config_defaults()
         super()._apply_causal_cache_overrides(batch, server_args)
         self._kv_quant_args = server_args.kv_cache_quant_config
+        self._varq_quant_args = getattr(server_args, "kv_cache_varq_config", None)
         self._sync_interactive_kv_cache_window(server_args)
 
     def _reset_causal_cache_config_defaults(self) -> None:

@@ -31,6 +31,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
+from sglang.multimodal_gen.configs.quantization.varq_kv import VARQKVQuantArgs
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
@@ -556,6 +557,12 @@ class ServerArgs(DisaggServerArgsMixin):
     # SRT --kv-cache-dtype pattern (typed config, not a pile of env vars).
     kv_cache_quant_config: QVGKVQuantArgs = field(
         default_factory=QVGKVQuantArgs, repr=False
+    )
+
+    # KV-cache quantization (VAR-Q). Off by default; mutually exclusive with
+    # kv_cache_quant_config.
+    kv_cache_varq_config: VARQKVQuantArgs = field(
+        default_factory=VARQKVQuantArgs, repr=False
     )
 
     # Master port for distributed inference
@@ -2938,6 +2945,69 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Leading sink chunks kept bf16 forever (default 0).",
         )
 
+        # KV-cache quantization (VAR-Q)
+        parser.add_argument(
+            "--kv-cache-varq",
+            type=str,
+            default=None,
+            choices=["off", "int8", "int6", "int4", "int3", "int2"],
+            help="Enable VAR-Q KV-cache quantization (off|int8|int6|int4|int3|"
+            "int2). Tuning-free: no calibration or clustering. Uses one "
+            "symmetric scale per (generation chunk, head, channel). "
+            "Mutually exclusive with --kv-cache-quant.",
+        )
+        parser.add_argument(
+            "--kv-cache-varq-quant-method",
+            type=str,
+            default=None,
+            help="VAR-Q scale grouping (default VARQ: per chunk/head/channel).",
+        )
+        parser.add_argument(
+            "--kv-cache-varq-compression-ratio",
+            type=float,
+            default=None,
+            help="Scale sub-grouping inside a segment (default 1.0: one scale "
+            "group per segment).",
+        )
+        parser.add_argument(
+            "--kv-cache-varq-max-scale-seq-len",
+            type=int,
+            default=None,
+            help="Optional cap on the number of tokens sharing a scale group.",
+        )
+        parser.add_argument(
+            "--kv-cache-varq-pack-to-int32",
+            type=int,
+            default=None,
+            choices=[0, 1],
+            help="Pack sub-byte codes into int32 words (1, default).",
+        )
+        parser.add_argument(
+            "--kv-cache-varq-dequant-dtype",
+            type=str,
+            default=None,
+            help="Dequantization dtype (default native: the cache dtype).",
+        )
+        parser.add_argument(
+            "--kv-cache-varq-keep-recent",
+            type=int,
+            default=None,
+            help="Completed chunks kept bf16 before quantizing (default 1).",
+        )
+        parser.add_argument(
+            "--kv-cache-varq-sink",
+            type=int,
+            default=None,
+            choices=[0, 1],
+            help="Quantize the attention sink too (1, default) or keep it bf16 (0).",
+        )
+        parser.add_argument(
+            "--kv-cache-varq-sink-keep",
+            type=int,
+            default=None,
+            help="Leading sink chunks kept bf16 forever (default 0).",
+        )
+
         # quantization
         parser.add_argument(
             "--quantization",
@@ -3707,6 +3777,19 @@ class ServerArgs(DisaggServerArgsMixin):
                         "kv_cache_quant_config must be QVGKVQuantArgs or a dict"
                     )
                 server_args_kwargs["kv_cache_quant_config"] = kv_quant_config
+            elif attr == "kv_cache_varq_config":
+                varq_quant_config = kwargs.get("kv_cache_varq_config")
+                if varq_quant_config is None:
+                    varq_quant_config = VARQKVQuantArgs.from_dict(kwargs)
+                elif isinstance(varq_quant_config, dict):
+                    varq_quant_config = VARQKVQuantArgs(**varq_quant_config).validate()
+                elif isinstance(varq_quant_config, VARQKVQuantArgs):
+                    varq_quant_config.validate()
+                else:
+                    raise TypeError(
+                        "kv_cache_varq_config must be VARQKVQuantArgs or a dict"
+                    )
+                server_args_kwargs["kv_cache_varq_config"] = varq_quant_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 

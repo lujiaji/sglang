@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
 from sglang.multimodal_gen.runtime.layers.kvcache.qvg_packed_cache import (
     QVGPackedCausalKVCache,
 )
+from sglang.multimodal_gen.runtime.layers.kvcache.varq_packed_cache import (
+    VARQPackedCausalKVCache,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
@@ -49,7 +52,10 @@ logger = init_logger(__name__)
 CAUSAL_BLOCK_PROMPTS_KEY = "causal_block_prompts"
 CAUSAL_SCENE_CUT_MASK_KEY = "causal_scene_cut_mask"
 CAUSAL_SHOT_INDICES_KEY = "causal_shot_indices"
-CausalKVCache = CausalSelfAttentionKVCache | QVGPackedCausalKVCache
+CausalKVCache = (
+    CausalSelfAttentionKVCache | QVGPackedCausalKVCache | VARQPackedCausalKVCache
+)
+
 
 
 def expand_causal_block_prompts(
@@ -424,7 +430,23 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 f"{type(self).__name__} does not support QVG KV-cache quantization"
             )
 
+        varq_config = getattr(server_args, "kv_cache_varq_config", None)
+        if varq_config is not None and varq_config.enabled:
+            if server_args.kv_cache_quant_config.enabled:
+                raise ValueError(
+                    "kv-cache-quant (QVG) and kv-cache-varq are mutually "
+                    "exclusive; enable only one KV-cache quantizer"
+                )
+            if not self._supports_varq_kv_cache_quantization():
+                raise ValueError(
+                    f"{type(self).__name__} does not support VAR-Q KV-cache "
+                    f"quantization"
+                )
+
     def _supports_qvg_kv_cache_quantization(self) -> bool:
+        return False
+
+    def _supports_varq_kv_cache_quantization(self) -> bool:
         return False
 
     def _causal_sequence_shard_enabled(self, batch: Req) -> bool:
