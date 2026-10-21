@@ -397,6 +397,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> None:
+        self._kv_quant_args = server_args.kv_cache_quant_config
+        self._varq_quant_args = getattr(server_args, "kv_cache_varq_config", None)
         pipeline_config = server_args.pipeline_config
         sink_size = getattr(batch, "realtime_causal_sink_size", None)
         if sink_size is None:
@@ -1148,26 +1150,87 @@ class CausalDMDDenoisingStage(DenoisingStage):
         attention_window_size: int | None = None,
         allow_growth: bool = False,
     ) -> list[CausalKVCache]:
+        kv_quant_args = getattr(self, "_kv_quant_args", None)
+        varq_args = getattr(self, "_varq_quant_args", None)
+        qvg_enabled = kv_quant_args is not None and kv_quant_args.enabled
+        varq_enabled = varq_args is not None and varq_args.enabled
+
+        if not qvg_enabled and not varq_enabled:
+            if attention_window_size is None:
+                attention_window_size = kv_cache_size
+            int_index = 0 if use_int_indices else None
+            shape = [
+                batch_size,
+                kv_cache_size,
+                num_attention_heads,
+                attention_head_dim,
+            ]
+            return [
+                CausalSelfAttentionKVCache(
+                    k=torch.zeros(shape, dtype=dtype, device=device),
+                    v=torch.zeros(shape, dtype=dtype, device=device),
+                    global_end_index=torch.zeros(1, dtype=torch.long, device=device),
+                    local_end_index=torch.zeros(1, dtype=torch.long, device=device),
+                    global_end_index_int=int_index,
+                    local_end_index_int=int_index,
+                    cache_size=kv_cache_size,
+                    sink_tokens=sink_tokens,
+                    global_sink_tokens=global_sink_tokens,
+                    attention_window_size=attention_window_size,
+                    allow_growth=allow_growth,
+                )
+                for _ in range(self.num_transformer_blocks)
+            ]
+
+        # The packed caches handle the fixed-window sliding-window path only.
+        if global_sink_tokens or allow_growth:
+            raise NotImplementedError(
+                "packed KV caches do not support global sinks or cache growth"
+            )
         if attention_window_size is None:
             attention_window_size = kv_cache_size
-        int_index = 0 if use_int_indices else None
-        shape = [batch_size, kv_cache_size, num_attention_heads, attention_head_dim]
-        return [
-            CausalSelfAttentionKVCache(
-                k=torch.zeros(shape, dtype=dtype, device=device),
-                v=torch.zeros(shape, dtype=dtype, device=device),
+        if varq_enabled:
+            assert varq_args is not None  # narrowed by varq_enabled
+            varq_caches: list[CausalKVCache] = [
+                VARQPackedCausalKVCache(
+                    batch_size=batch_size,
+                    cache_size=kv_cache_size,
+                    num_heads=num_attention_heads,
+                    head_dim=attention_head_dim,
+                    dtype=dtype,
+                    device=device,
+                    use_int_indices=use_int_indices,
+                    global_end_index=torch.zeros(
+                        1, dtype=torch.long, device=device
+                    ),
+                    local_end_index=torch.zeros(1, dtype=torch.long, device=device),
+                    sink_tokens=sink_tokens,
+                    attention_window_size=attention_window_size,
+                    quant_args=varq_args,
+                )
+                for _ in range(self.num_transformer_blocks)
+            ]
+            return varq_caches
+
+        assert kv_quant_args is not None  # narrowed by qvg_enabled
+        qvg_caches: list[CausalKVCache] = [
+            QVGPackedCausalKVCache(
+                batch_size=batch_size,
+                cache_size=kv_cache_size,
+                num_heads=num_attention_heads,
+                head_dim=attention_head_dim,
+                dtype=dtype,
+                device=device,
+                use_int_indices=use_int_indices,
                 global_end_index=torch.zeros(1, dtype=torch.long, device=device),
                 local_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                global_end_index_int=int_index,
-                local_end_index_int=int_index,
-                cache_size=kv_cache_size,
                 sink_tokens=sink_tokens,
-                global_sink_tokens=global_sink_tokens,
                 attention_window_size=attention_window_size,
-                allow_growth=allow_growth,
+                quant_args=kv_quant_args,
             )
             for _ in range(self.num_transformer_blocks)
         ]
+        return qvg_caches
 
     @torch.no_grad()
     def forward(

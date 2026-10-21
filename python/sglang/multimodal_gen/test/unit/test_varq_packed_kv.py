@@ -234,6 +234,8 @@ class TestStageWiring(unittest.TestCase):
         )
         stage.sink_size = 0
         stage.sliding_window_num_frames = 1
+        # LingBot's override consults transformer.config before delegating
+        stage.transformer = SimpleNamespace(config=None)
 
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             stage._apply_causal_cache_overrides(

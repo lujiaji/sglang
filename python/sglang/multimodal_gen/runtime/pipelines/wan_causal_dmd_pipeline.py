@@ -22,6 +22,14 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 # isort: on
 
 
+class WanCausalDMDDenoisingStage(CausalDMDDenoisingStage):
+    def _supports_qvg_kv_cache_quantization(self) -> bool:
+        return True
+
+    def _supports_varq_kv_cache_quantization(self) -> bool:
+        return True
+
+
 class WanCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "WanCausalDMDPipeline"
 
@@ -39,7 +47,7 @@ class WanCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_latent_preparation_stage()
 
         self.add_stage(
-            CausalDMDDenoisingStage(
+            WanCausalDMDDenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
             ),
