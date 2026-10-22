@@ -197,7 +197,8 @@ def test_causal_dmd_forward_context_uses_prepare_hooks(monkeypatch):
     assert ctx.device == torch.device("cpu")
     assert ctx.scheduler == "scheduler"
     assert ctx.timesteps.tolist() == [9]
-    assert ctx.latents is latents
+    assert torch.equal(ctx.latents, latents)
+    assert ctx.latents is not latents
     assert ctx.prompt_embeds == ["prompt"]
     assert ctx.image_kwargs == {"image": torch.float16}
     assert ctx.pos_cond_kwargs == {"pos": torch.float16}
