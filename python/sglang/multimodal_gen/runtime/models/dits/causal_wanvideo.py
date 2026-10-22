@@ -451,11 +451,10 @@ class CausalWanTransformerBlock(nn.Module):
         )
 
         # 2. Cross-attention
-        attn_output = self.attn2(
-            norm_hidden_states,
-            context=encoder_hidden_states,
-            context_lens=None,
-            crossattn_cache=crossattn_cache,
+        # WanT2VCrossAttention.forward does not take a cross-attn cache; route
+        # through the helper that stores/reuses K/V across denoise steps.
+        attn_output = self._cross_attn_with_cache(
+            norm_hidden_states, encoder_hidden_states, crossattn_cache
         )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa

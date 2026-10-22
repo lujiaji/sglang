@@ -399,6 +399,11 @@ class CausalDMDDenoisingStage(DenoisingStage):
     ) -> None:
         self._kv_quant_args = server_args.kv_cache_quant_config
         self._varq_quant_args = getattr(server_args, "kv_cache_varq_config", None)
+        logger.info(
+            "Causal KV quant config: qvg=%r varq=%r",
+            getattr(self._kv_quant_args, "describe", lambda: self._kv_quant_args)(),
+            getattr(self._varq_quant_args, "describe", lambda: self._varq_quant_args)(),
+        )
         pipeline_config = server_args.pipeline_config
         sink_size = getattr(batch, "realtime_causal_sink_size", None)
         if sink_size is None:
@@ -1152,8 +1157,37 @@ class CausalDMDDenoisingStage(DenoisingStage):
     ) -> list[CausalKVCache]:
         kv_quant_args = getattr(self, "_kv_quant_args", None)
         varq_args = getattr(self, "_varq_quant_args", None)
+        if kv_quant_args is None or varq_args is None:
+            # Some causal pipelines allocate the cache without going through
+            # _apply_causal_cache_overrides first; fall back to the process-wide
+            # args so a --kv-cache-varq/--kv-cache-quant request is not dropped.
+            try:
+                from sglang.multimodal_gen.runtime.server_args import (
+                    get_global_server_args,
+                )
+
+                _sa = get_global_server_args()
+            except Exception:
+                _sa = None
+            if _sa is not None:
+                if kv_quant_args is None:
+                    kv_quant_args = getattr(_sa, "kv_cache_quant_config", None)
+                if varq_args is None:
+                    varq_args = getattr(_sa, "kv_cache_varq_config", None)
         qvg_enabled = kv_quant_args is not None and kv_quant_args.enabled
         varq_enabled = varq_args is not None and varq_args.enabled
+        logger.info(
+            "Causal KV cache allocation: cache_size=%s window=%s sink=%s "
+            "global_sink=%s growth=%s qvg=%s varq=%s blocks=%s",
+            kv_cache_size,
+            attention_window_size,
+            sink_tokens,
+            global_sink_tokens,
+            allow_growth,
+            qvg_enabled,
+            varq_enabled,
+            self.num_transformer_blocks,
+        )
 
         if not qvg_enabled and not varq_enabled:
             if attention_window_size is None:
