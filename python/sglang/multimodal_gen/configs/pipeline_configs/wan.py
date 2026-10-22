@@ -441,6 +441,23 @@ class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
     warp_denoising_step: bool = True
 
 
+@dataclass
+class CausalWanT2V480PConfig(WanT2V480PConfig):
+    """Causal chunked Wan T2V with a normal-length denoising schedule.
+
+    SelfForcingWanT2V480PConfig hardcodes [1000, 750, 500, 250] plus step warping,
+    which is only valid for distilled checkpoints; base Wan weights produce noise
+    under it. This variant keeps the causal stage (which requires an explicit step
+    list) but uses a uniform 20-step schedule with warping off.
+    """
+
+    is_causal: bool = True
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [1000 - 50 * i for i in range(20)]
+    )
+    warp_denoising_step: bool = False
+
+
 def register():
     from sglang.multimodal_gen.configs.sample.wan import (
         FastWanT2V480PConfig,
@@ -474,6 +491,12 @@ def register():
         sampling_param_cls=SelfForcingWanT2V480P_SamplingParams,
         pipeline_config_cls=SelfForcingWanT2V480PConfig,
         model_detectors=[lambda name: "wancausaldmdpipeline" in name.lower()],
+    )
+    # Causal Wan with base (non-distilled) weights: same causal path, normal steps.
+    register_configs(
+        sampling_param_cls=WanT2V_1_3B_SamplingParams,
+        pipeline_config_cls=CausalWanT2V480PConfig,
+        model_detectors=[lambda name: "causalwant2vpipeline" in name.lower()],
     )
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,

@@ -347,7 +347,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         autocast_enabled = self._autocast_enabled(target_dtype, server_args)
         device = get_local_torch_device()
         scheduler = self._get_causal_dmd_scheduler(batch, server_args)
-        latents = self._get_causal_dmd_latents(batch)
+        latents = self._get_causal_dmd_latents(batch).clone()
         b, c, t, h, w = latents.shape
         self._prepare_frame_seq_length(h, w)
         timesteps = self._prepare_causal_dmd_timesteps(
