@@ -130,6 +130,11 @@ diffusion = [
   "xatlas",
 ]
 
+diffusion-varq = [
+  # VAR-Q is optional and is only imported when --kv-cache-varq is enabled.
+  "VAR-Q @ git+https://github.com/lujiaji/VAR-Q.git",
+]
+
 diffusion-qvg = [
   # quant-videogen 0.1.0 pins an incompatible Torch version, so it is
   # installed separately with --no-deps; this extra provides its missing
