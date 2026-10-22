@@ -53,10 +53,10 @@ def _varq_functions():
         from VAR_Q import dequantize_tensor, quantize_tensor
     except ImportError as e:
         raise ImportError(
-            "VAR-Q KV-cache quantization requires its optional runtime "
-            "dependency. Install it with: "
-            "pip install 'sglang[diffusion-varq]' && "
-            "pip install VAR-Q."
+            "VAR-Q KV-cache quantization requires the optional VAR-Q runtime "
+            "package exposing the `VAR_Q` module. Install that package separately "
+            "and make it available on PYTHONPATH before enabling "
+            "--kv-cache-varq."
         ) from e
     return quantize_tensor, dequantize_tensor
 
