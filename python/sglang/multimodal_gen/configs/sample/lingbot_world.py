@@ -3,6 +3,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
+from typing import Any
 
 from sglang.multimodal_gen.configs.sample.wan import Wan2_2_I2V_A14B_SamplingParam
 
@@ -17,6 +18,7 @@ class LingBotWorldSamplingParams(Wan2_2_I2V_A14B_SamplingParam):
     num_inference_steps: int = 70
     num_frames: int = 117
     fps: int = 16
+    realtime_causal_kv_cache_num_frames: int | None = None
 
     def _adjust(self, server_args):
         enable_sequence_shard = self.enable_sequence_shard
@@ -37,3 +39,16 @@ class LingBotWorldSamplingParams(Wan2_2_I2V_A14B_SamplingParam):
             self.condition_inputs["camera_actions"] = self.actions
         if self.chunk_size is not None:
             self.realtime_chunk_size = self.chunk_size
+        if self.realtime_causal_kv_cache_num_frames is None:
+            self.realtime_causal_kv_cache_num_frames = getattr(
+                server_args.pipeline_config,
+                "realtime_causal_kv_cache_num_frames",
+                None,
+            )
+
+    def apply_request_extra(self, req: Any) -> None:
+        super().apply_request_extra(req)
+        if self.realtime_causal_kv_cache_num_frames is not None:
+            req.realtime_causal_kv_cache_num_frames = (
+                self.realtime_causal_kv_cache_num_frames
+            )

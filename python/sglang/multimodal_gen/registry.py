@@ -438,7 +438,10 @@ def _get_config_info(
     if model_id is not None:
         model_id_lower = model_id.lower()
         for registered_hf_id in all_model_hf_paths:
-            if get_model_short_name(registered_hf_id).lower() == model_id_lower:
+            if (
+                registered_hf_id.lower() == model_id_lower
+                or get_model_short_name(registered_hf_id).lower() == model_id_lower
+            ):
                 logger.debug(
                     f"Resolved model via explicit --model-id '{model_id}' → '{registered_hf_id}'."
                 )

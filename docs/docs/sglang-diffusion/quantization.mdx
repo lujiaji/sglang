@@ -348,6 +348,46 @@ support LongLive2 pinned sinks, global sinks, or dynamically growing caches.
 | `--kv-cache-quant-sink {0,1}` | `1` | Whether to quantize completed sink chunks. |
 | `--kv-cache-quant-sink-keep` | `0` | Number of leading sink chunks retained in BF16. |
 
+### VAR-Q symmetric packed cache
+
+VAR-Q is a separate runtime KV-cache backend for causal denoising. It quantizes
+completed cache segments; it does **not** quantize checkpoint weights. The backend
+uses one symmetric scale per `(generation chunk, head, channel)`, has no
+zero-point, calibration pass, or clustering step, and supports `int8`, `int6`,
+`int4`, `int3`, and `int2`. It is disabled by default and is selected with the
+master flag below:
+
+```bash
+sglang generate \
+  --model-path /path/to/causal-model \
+  --kv-cache-varq int4
+```
+
+The VAR-Q flag is mutually exclusive with the existing QVG/PRQ flag. Do not pass
+both `--kv-cache-varq` and `--kv-cache-quant`.
+
+| Option | Default | Effect |
+| --- | ---: | --- |
+| `--kv-cache-varq {off,int8,int6,int4,int3,int2}` | `off` | Selects VAR-Q storage precision. |
+| `--kv-cache-varq-quant-method` | `VARQ` | Selects the VAR-Q scale grouping method. |
+| `--kv-cache-varq-compression-ratio` | `1.0` | Sub-groups scales within a segment. |
+| `--kv-cache-varq-max-scale-seq-len` | unset | Caps tokens sharing one scale group. |
+| `--kv-cache-varq-pack-to-int32` | `1` | Packs sub-byte codes into int32 words; required for int6/int3/int2. |
+| `--kv-cache-varq-dequant-dtype` | `native` | Dtype used for dequantization. |
+| `--kv-cache-varq-keep-recent` | `1` | Completed chunks retained in BF16 before quantization. |
+| `--kv-cache-varq-sink` | `1` | Whether the attention sink is eligible for quantization. |
+| `--kv-cache-varq-sink-keep` | `0` | Leading sink chunks retained in BF16. |
+
+The current implementation keeps the mutable chunk and recent retained chunks in
+BF16, packs older completed segments, and reconstructs the visible window for the
+existing attention path. It does not provide fused dequantization-attention yet.
+Resident-memory savings depend on window length and retained chunks; resident KV
+bytes and whole-process peak allocated/reserved memory are different measurements.
+
+This page documents the interface and storage contract, not a quality or
+performance guarantee. Validate the selected causal pipeline with real model
+activations and a fixed protocol before relying on a precision or latency choice.
+
 ## Online Quantization
 
 This section describes the online methods currently implemented by the
