@@ -388,6 +388,63 @@ This page documents the interface and storage contract, not a quality or
 performance guarantee. Validate the selected causal pipeline with real model
 activations and a fixed protocol before relying on a precision or latency choice.
 
+### Reviewer reproducibility runner
+
+The repository includes `examples/diffusion/lingbot_world/reproduce_causal_kv.py`.
+It uses the same LingBot World 2.0 model configuration for all three arms:
+BF16, VAR-Q int4, and QVG int4. Each arm sends seven requests in one persistent
+realtime session (`block_idx` 0 through 6), preserving seed and the 18-frame
+causal window. The expected decoded chunk lengths are `9,12,12,12,12,12,12`
+(81 frames total). Provide an input image and prompt explicitly; the runner has
+no teaser or personal-path fallback.
+
+First validate the manifest without importing inference dependencies or doing
+model work:
+
+```bash
+python examples/diffusion/lingbot_world/reproduce_causal_kv.py bf16 \
+  --image /path/to/examples/03/image.jpg --prompt "A serene lakeside scene" \
+  --output /tmp/lingbot-bf16
+```
+
+Run each arm on NVIDIA CUDA with a fresh output directory:
+
+```bash
+python examples/diffusion/lingbot_world/reproduce_causal_kv.py bf16 --image /path/to/image.jpg --prompt "A serene lakeside scene" --output /tmp/lingbot-bf16 --num-gpus 8 --execute
+python examples/diffusion/lingbot_world/reproduce_causal_kv.py varq --image /path/to/image.jpg --prompt "A serene lakeside scene" --output /tmp/lingbot-varq --num-gpus 8 --execute
+python examples/diffusion/lingbot_world/reproduce_causal_kv.py qvg  --image /path/to/image.jpg --prompt "A serene lakeside scene" --output /tmp/lingbot-qvg  --num-gpus 8 --execute
+```
+
+Install SGLang's diffusion dependencies in the repository environment. VAR-Q
+also requires the separately packaged `VAR_Q` provider. QVG requires
+`quant-videogen`; install it without dependency replacement so it cannot change
+the environment's pinned Torch:
+
+```bash
+pip install -e "python[diffusion]"
+pip install --no-deps quant-videogen==0.1.0
+```
+
+Install a compatible VAR-Q provider exposing `VAR_Q.quantize_tensor` and
+`VAR_Q.dequantize_tensor` separately; clean-environment installation of that
+provider remains unverified. The import name is not a verified PyPI package name.
+
+The script writes `manifest.json`, per-chunk `*_perf.json`, `progress.json`,
+and `summary.json`. It decodes every chunk and fails if any chunk or the total
+has the wrong frame count. Inspect the first, middle, last, and chunk-boundary
+frames before treating a run as valid; frame-count success does not establish
+visual correctness. Compare cold/JIT-inclusive request sums separately from
+later chunks: these timings include request work and output decode/write and
+are not warmed benchmark numbers. The runner uses forward-key actions and
+realtime per-chunk RNG; it is not numerical parity with the official offline
+`poses.npy` trajectory or full-sequence float32 noise allocation.
+
+QVG on A100/SM80 is not silently rewritten by this runner. Its default FP8
+scale path is incompatible with SM80. This runner rejects pre-Hopper GPUs for
+the QVG arm; it does not include the experimental BF16-scale patch used in earlier
+local runs. Use Hopper or newer for this three-arm recipe. End-to-end execution
+of this reviewer runner remains unverified.
+
 ## Online Quantization
 
 This section describes the online methods currently implemented by the
