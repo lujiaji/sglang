@@ -57,7 +57,6 @@ CausalKVCache = (
 )
 
 
-
 def expand_causal_block_prompts(
     shot_prompts: list[str],
     *,
@@ -853,6 +852,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             else:
                 current_latents = x0_btchw.permute(0, 2, 1, 3, 4)
 
+            self.check_cancelled(batch)
             if progress_bar is not None:
                 progress_bar.update()
 
@@ -1234,9 +1234,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     dtype=dtype,
                     device=device,
                     use_int_indices=use_int_indices,
-                    global_end_index=torch.zeros(
-                        1, dtype=torch.long, device=device
-                    ),
+                    global_end_index=torch.zeros(1, dtype=torch.long, device=device),
                     local_end_index=torch.zeros(1, dtype=torch.long, device=device),
                     sink_tokens=sink_tokens,
                     attention_window_size=attention_window_size,

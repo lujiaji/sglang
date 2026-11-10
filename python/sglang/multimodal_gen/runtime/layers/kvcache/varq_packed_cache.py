@@ -385,7 +385,9 @@ class VARQPackedCausalKVCache:
         if sink_end > 0:
             intervals.append((0, sink_end))
         if self._pinned_len > 0 and self._pinned_start >= 0:
-            intervals.append((self._pinned_start, self._pinned_start + self._pinned_len))
+            intervals.append(
+                (self._pinned_start, self._pinned_start + self._pinned_len)
+            )
         intervals.append((tail_start, self._global_end))
         return _merge_intervals(intervals)
 

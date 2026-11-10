@@ -34,9 +34,7 @@ def _parse_bits(val: str | int | None) -> int | None:
         return val
     key = str(val).strip().lower()
     if key not in _BITS:
-        raise ValueError(
-            f"kv-cache-varq must be one of {list(_BITS)}, got {val!r}"
-        )
+        raise ValueError(f"kv-cache-varq must be one of {list(_BITS)}, got {val!r}")
     return _BITS[key]
 
 
@@ -69,17 +67,13 @@ class VARQKVQuantArgs:
                 f"kv-cache-varq bits must be one of 2/3/4/6/8, got {self.bits}"
             )
         if self.bits is not None and not self.pack_to_int32 and self.bits in (2, 3, 6):
-            raise ValueError(
-                f"kv-cache-varq bits={self.bits} requires pack_to_int32"
-            )
+            raise ValueError(f"kv-cache-varq bits={self.bits} requires pack_to_int32")
         if not (0.0 < float(self.compression_ratio)):
             raise ValueError("kv-cache-varq compression_ratio must be positive")
         if self.max_scale_seq_len is not None and self.max_scale_seq_len <= 0:
             raise ValueError("kv-cache-varq max_scale_seq_len must be positive")
         if self.keep_recent_chunks < 0 or self.sink_keep_chunks < 0:
-            raise ValueError(
-                "keep_recent_chunks / sink_keep_chunks must be >= 0"
-            )
+            raise ValueError("keep_recent_chunks / sink_keep_chunks must be >= 0")
         return self
 
     def describe(self) -> str:

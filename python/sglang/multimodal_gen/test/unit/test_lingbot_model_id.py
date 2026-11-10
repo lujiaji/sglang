@@ -1,13 +1,17 @@
 """Regression for full repo IDs selecting native LingBot config defaults."""
+
 import pytest
 
 from sglang.multimodal_gen import registry
 
 
-@pytest.mark.parametrize("model_id", [
-    "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
-    "lingbot-world-v2-14b-causal-fast-diffusers",
-])
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+        "lingbot-world-v2-14b-causal-fast-diffusers",
+    ],
+)
 def test_lingbot_explicit_model_id_preserves_arch_defaults(model_id):
     registry._discover_and_register_configs()
     info = registry._get_config_info("/local/renamed-lingbot-checkpoint", model_id)

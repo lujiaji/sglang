@@ -106,7 +106,9 @@ class TestVARQKVQuantArgs(unittest.TestCase):
             ("int3", 3),
             ("int2", 2),
         ):
-            self.assertEqual(VARQKVQuantArgs.from_dict({"kv_cache_varq": name}).bits, bits)
+            self.assertEqual(
+                VARQKVQuantArgs.from_dict({"kv_cache_varq": name}).bits, bits
+            )
 
     def test_overrides_and_validation(self):
         a = VARQKVQuantArgs.from_dict(
