@@ -1225,7 +1225,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             attention_window_size = kv_cache_size
         if varq_enabled:
             assert varq_args is not None  # narrowed by varq_enabled
-            varq_caches: list[CausalKVCache] = [
+            return [
                 VARQPackedCausalKVCache(
                     batch_size=batch_size,
                     cache_size=kv_cache_size,
@@ -1244,10 +1244,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 )
                 for _ in range(self.num_transformer_blocks)
             ]
-            return varq_caches
 
         assert kv_quant_args is not None  # narrowed by qvg_enabled
-        qvg_caches: list[CausalKVCache] = [
+        return [
             QVGPackedCausalKVCache(
                 batch_size=batch_size,
                 cache_size=kv_cache_size,
@@ -1264,7 +1263,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )
             for _ in range(self.num_transformer_blocks)
         ]
-        return qvg_caches
 
     @torch.no_grad()
     def forward(

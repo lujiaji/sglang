@@ -63,7 +63,7 @@ def _packed(B, W, H, D, sink, dev, quant, use_int_indices=False):
     )
 
 
-def _replay(cache, chunks, C, H, D, B, nsteps, rwt, data, dev):
+def _replay(cache, chunks, C, nsteps, rwt, data):
     views = []
     for ci in range(chunks):
         g = ci * C
@@ -149,8 +149,8 @@ class TestPackedStorageEquivalence(unittest.TestCase):
         }
         base = _base(B, W, H, D, sink, dev)
         packed = _packed(B, W, H, D, sink, dev, VARQKVQuantArgs())  # disabled
-        ob = _replay(base, chunks, C, H, D, B, nsteps, rwt, data, dev)
-        op = _replay(packed, chunks, C, H, D, B, nsteps, rwt, data, dev)
+        ob = _replay(base, chunks, C, nsteps, rwt, data)
+        op = _replay(packed, chunks, C, nsteps, rwt, data)
         for i, ((bk, bv), (pk, pv)) in enumerate(zip(ob, op)):
             self.assertEqual(bk.shape, pk.shape, f"chunk {i} shape")
             self.assertTrue(torch.equal(bk, pk), f"chunk {i} K mismatch")
@@ -321,8 +321,8 @@ class TestPackedQuantMemory(unittest.TestCase):
         }
         base = _base(B, W, H, D, sink, dev)
         packed = _packed(B, W, H, D, sink, dev, q)
-        ob = _replay(base, chunks, C, H, D, B, nsteps, None, data, dev)
-        op = _replay(packed, chunks, C, H, D, B, nsteps, None, data, dev)
+        ob = _replay(base, chunks, C, nsteps, None, data)
+        op = _replay(packed, chunks, C, nsteps, None, data)
         dense_bytes = base.k.numel() * base.k.element_size() * 2
         self.assertLess(
             packed.resident_nbytes(),
