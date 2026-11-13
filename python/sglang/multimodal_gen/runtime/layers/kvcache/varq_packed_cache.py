@@ -6,7 +6,7 @@ deliberately the same shape as the sibling ``qvg_packed_cache``):
 
   * The retained window is split into chunk-aligned *segments* in global token
     order. Each segment is either bf16 (``k``/``v`` tensors resident) or
-    VAR-Q-quantized (``qk``/``qv`` metadata resident, bf16 freed).
+    VAR-Q-quantized (``packed_k``/``packed_v`` metadata resident, bf16 freed).
   * The current (still-denoising) chunk and the newest ``keep_recent_chunks``
     completed chunks stay bf16 (rewritten each denoise step / attended cleanly).
   * Older completed segments are quantized once and their bf16 freed, so the
@@ -30,14 +30,18 @@ silently diverge.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import cache
+from typing import Any, cast
 
 import torch
 
 from sglang.multimodal_gen.configs.quantization.varq_kv import VARQKVQuantArgs
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalAttentionKVView,
+)
+from sglang.multimodal_gen.runtime.layers.kvcache.qvg_packed_cache import (
+    QVGPackedCausalKVCache,
+    _Segment,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -59,29 +63,6 @@ def _varq_functions():
             "--kv-cache-varq."
         ) from e
     return quantize_tensor, dequantize_tensor
-
-
-@dataclass
-class _Segment:
-    g0: int  # global start token (inclusive)
-    g1: int  # global end token (exclusive)
-    is_sink: bool  # sink segments are never evicted
-    k: torch.Tensor | None = None
-    v: torch.Tensor | None = None
-    qk: dict | None = None
-    qv: dict | None = None
-
-    @property
-    def packed(self) -> bool:
-        return self.qk is not None
-
-    def nbytes(self) -> int:
-        if self.packed:
-            return _packed_nbytes(self.qk) + _packed_nbytes(self.qv)
-        return (
-            self.k.numel() * self.k.element_size()
-            + self.v.numel() * self.v.element_size()
-        )
 
 
 def _packed_nbytes(q: dict | None) -> int:
@@ -109,8 +90,13 @@ def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
-class VARQPackedCausalKVCache:
-    """Chunk-segmented causal KV cache with VAR-Q-quantized cold segments."""
+class VARQPackedCausalKVCache(QVGPackedCausalKVCache):
+    """Share QVG's segment lifecycle, but keep VAR-Q storage and view semantics.
+
+    The inherited write/eviction paths use only segment boundaries, dense K/V,
+    and the shared recency/sink policy. Quantization, byte accounting and dense
+    reconstruction stay here because the packed dictionaries and layouts differ.
+    """
 
     def __init__(
         self,
@@ -128,41 +114,27 @@ class VARQPackedCausalKVCache:
         attention_window_size: int | None = None,
         quant_args: VARQKVQuantArgs,
     ) -> None:
-        self.batch_size = batch_size
-        self.cache_size = cache_size
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.dtype = dtype
-        self.device = device
-        self.sink_tokens = sink_tokens
-        self.global_sink_tokens = 0
-        self.attention_window_size = attention_window_size or cache_size
-        self.q = quant_args
-        # kept for API compatibility with the dense cache (indices are not read
-        # by consumers, but reset/patterns touch them)
-        self.global_end_index = global_end_index
-        self.local_end_index = local_end_index
-        self.global_end_index_int = 0 if use_int_indices else None
-        self.local_end_index_int = 0 if use_int_indices else None
-
-        self._segments: list[_Segment] = []  # completed, global-ordered
-        self._cur: _Segment | None = None  # current (mutable) chunk
-        self._global_end = 0
-        self._chunk_tokens = 0  # inferred from first advance
-        self._pinned_start = -1  # global token index of the pinned sink
-        self._pinned_len = 0
+        super().__init__(
+            batch_size=batch_size,
+            cache_size=cache_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            device=device,
+            global_end_index=global_end_index,
+            local_end_index=local_end_index,
+            use_int_indices=use_int_indices,
+            sink_tokens=sink_tokens,
+            attention_window_size=attention_window_size,
+            # The lifecycle reads only the shared recency/sink policy fields.
+            quant_args=cast(Any, quant_args),
+        )
+        self.reset_pinned_sink()
 
     # ------------------------------------------------------------------ api
     def reset_indices(self) -> None:
-        self._segments = []
-        self._cur = None
-        self._global_end = 0
+        super().reset_indices()
         self.reset_pinned_sink()
-        if self.global_end_index_int is not None:
-            self.global_end_index_int = 0
-            self.local_end_index_int = 0
-        self.global_end_index.zero_()
-        self.local_end_index.zero_()
 
     def reset_pinned_sink(self) -> None:
         self._pinned_start = -1
@@ -185,121 +157,53 @@ class VARQPackedCausalKVCache:
         self._pinned_start = self._global_end - current_num_tokens
         self._pinned_len = min(self.sink_tokens, current_num_tokens)
 
-    def can_direct_current_attention(self, num_new_tokens: int) -> bool:
-        return (
-            self.sink_tokens == 0
-            and self.cache_size == num_new_tokens
-            and self.attention_window_size == num_new_tokens
-        )
-
-    @property
-    def num_cache_heads(self) -> int:
-        return self.num_heads
-
     def resident_nbytes(self) -> int:
-        total = sum(s.nbytes() for s in self._segments)
-        if self._cur is not None:
-            total += self._cur.nbytes()
+        # _Segment.nbytes() interprets packed dictionaries as QVG metadata.
+        total = 0
+        for seg in self._all_segments():
+            if seg.packed:
+                total += _packed_nbytes(seg.packed_k) + _packed_nbytes(seg.packed_v)
+            else:
+                total += seg.nbytes()
         return total
 
     # -------------------------------------------------------------- helpers
     def _quant_kwargs(self) -> dict:
-        bits = self.q.bits
+        # The base constructor stores the VAR-Q args passed by this adapter.
+        q = cast(VARQKVQuantArgs, self.q)
+        bits = q.bits
         if bits is None:
             raise RuntimeError("VAR-Q packed cache constructed with quantization off")
         return {
             "quant_bits": int(bits),
             "qkv_format": _QKV_FORMAT,
-            "quant_method": self.q.quant_method,
-            "pack_to_int32": self.q.pack_to_int32,
-            "dequant_dtype": self.q.dequant_dtype,
-            "compression_ratio": self.q.compression_ratio,
-            "max_scale_seq_len": self.q.max_scale_seq_len,
+            "quant_method": q.quant_method,
+            "pack_to_int32": q.pack_to_int32,
+            "dequant_dtype": q.dequant_dtype,
+            "compression_ratio": q.compression_ratio,
+            "max_scale_seq_len": q.max_scale_seq_len,
         }
-
-    def _new_bf16_segment(self, g0: int, g1: int, is_sink: bool) -> _Segment:
-        n = g1 - g0
-        k = torch.zeros(
-            self.batch_size,
-            n,
-            self.num_heads,
-            self.head_dim,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        v = torch.zeros_like(k)
-        return _Segment(g0=g0, g1=g1, is_sink=is_sink, k=k, v=v)
-
-    def _write(self, seg: _Segment, key, value, head_slice) -> None:
-        if head_slice is None:
-            seg.k.copy_(key)
-            seg.v.copy_(value)
-        else:
-            seg.k[:, :, head_slice, :] = key
-            seg.v[:, :, head_slice, :] = value
 
     def _pack(self, seg: _Segment) -> None:
         if seg.packed or seg.k is None:
             return
         quantize_tensor, _ = _varq_functions()
         kwargs = self._quant_kwargs()
-        seg.qk = quantize_tensor(seg.k, kv_role="k", **kwargs)
-        seg.qv = quantize_tensor(seg.v, kv_role="v", **kwargs)
+        seg.packed_k = quantize_tensor(seg.k, kv_role="k", **kwargs)
+        seg.packed_v = quantize_tensor(seg.v, kv_role="v", **kwargs)
         seg.k = None
         seg.v = None
         logger.info_once(f"Using VAR-Q packed KV cache: {self.q.describe()}")
 
-    def _dequant(self, q: dict) -> torch.Tensor:
+    def _dequant(self, packed: dict) -> torch.Tensor:
         _, dequantize_tensor = _varq_functions()
         return dequantize_tensor(
-            q["packed"],
-            q["scale"],
-            q.get("pack_meta"),
+            packed["packed"],
+            packed["scale"],
+            packed.get("pack_meta"),
             self.dtype,
-            quant_meta=q.get("quant_meta"),
+            quant_meta=packed.get("quant_meta"),
         )
-
-    def _all_segments(self) -> list[_Segment]:
-        segs = list(self._segments)
-        if self._cur is not None:
-            segs.append(self._cur)
-        return segs
-
-    def _sink_end(self) -> int:
-        return min(self.sink_tokens, self._global_end)
-
-    def _tail_start(self) -> int:
-        """Global start of the rolling recent tail (sink occupies its own budget
-        at the window front, matching the dense cache's roll)."""
-        sink_end = self._sink_end()
-        recent_budget = max(0, self.attention_window_size - sink_end)
-        return max(sink_end, self._global_end - recent_budget)
-
-    def _pack_and_evict(self) -> None:
-        """Quantize completed segments older than the recency guard; drop
-        segments that have slid entirely out of the window (sink never evicted)."""
-        tail_start = self._tail_start()
-
-        kept = []
-        for s in self._segments:
-            if not s.is_sink and s.g1 <= tail_start:
-                continue
-            kept.append(s)
-        self._segments = kept
-
-        if not self.q.enabled:
-            return
-        recent = self.q.keep_recent_chunks
-        nonsink = [s for s in self._segments if not s.is_sink]
-        cutoff_idx = len(nonsink) - recent
-        for i, s in enumerate(nonsink):
-            if i < cutoff_idx:
-                self._pack(s)
-        if self.q.sink:
-            sink_keep_tokens = self.q.sink_keep_chunks * max(1, self._chunk_tokens)
-            for s in self._segments:
-                if s.is_sink and s.g0 >= sink_keep_tokens:
-                    self._pack(s)
 
     # -------------------------------------------------------------- contract
     def update_and_get_attention_kv(
@@ -312,60 +216,19 @@ class VARQPackedCausalKVCache:
         recent_window_tokens: int | None = None,
         debug_name: str = "VAR-Q packed KV cache",
     ) -> CausalAttentionKVView:
-        num_new = key.shape[1]
-        num_input_heads = key.shape[2]
-        head_slice = None
-        if num_input_heads != self.num_heads:
-            if cache_head_start is None:
-                raise ValueError(
-                    f"{debug_name}: cache_head_start required for head slice"
-                )
-            head_slice = slice(cache_head_start, cache_head_start + num_input_heads)
-        cend = current_chunk_start + num_new
-
-        if self._cur is not None and current_chunk_start == self._cur.g0:
-            # rewrite current chunk in place (denoise step)
-            if cend != self._cur.g1:
-                raise NotImplementedError(
-                    f"{debug_name}: current-chunk rewrite size changed"
-                )
-            self._write(self._cur, key, value, head_slice)
-        elif current_chunk_start == self._global_end:
-            # advance: finalize current chunk, start a new one
-            if self._cur is not None:
-                self._segments.append(self._cur)
-            is_sink = current_chunk_start < self.sink_tokens
-            if self._chunk_tokens == 0:
-                self._chunk_tokens = num_new
-            self._cur = self._new_bf16_segment(current_chunk_start, cend, is_sink)
-            self._write(self._cur, key, value, head_slice)
-            self._global_end = cend
-            self._pack_and_evict()
-        else:
-            raise NotImplementedError(
-                f"{debug_name}: non-sequential write current_start="
-                f"{current_chunk_start} global_end={self._global_end} "
-                f"cur={None if self._cur is None else self._cur.g0}"
-            )
-
-        local_end = min(self._global_end, self.cache_size)
-        if self.global_end_index_int is not None:
-            self.global_end_index_int = self._global_end
-            self.local_end_index_int = local_end
-        else:
-            self.global_end_index.fill_(self._global_end)
-            self.local_end_index.fill_(local_end)
-
-        vk, vv = self._reconstruct(current_chunk_start, recent_window_tokens)
-        visible_tokens = vk.shape[1]
-        return CausalAttentionKVView(
-            k=vk,
-            v=vv,
-            local_start_index=max(0, visible_tokens - num_new),
-            local_end_index=visible_tokens,
-            visible_local_end=local_end,
-            visible_global_end=self._global_end,
+        view = super().update_and_get_attention_kv(
+            key=key,
+            value=value,
+            current_chunk_start=current_chunk_start,
+            cache_head_start=cache_head_start,
+            recent_window_tokens=recent_window_tokens,
+            debug_name=debug_name,
         )
+        # VAR-Q indexes the current chunk at the tail of the reconstructed view,
+        # not at the beginning as QVG's returned metadata does.
+        view.local_start_index = max(0, view.k.shape[1] - key.shape[1])
+        view.local_end_index = view.k.shape[1]
+        return view
 
     def _visible_intervals(
         self,
@@ -445,11 +308,12 @@ class VARQPackedCausalKVCache:
         for seg, i0, i1 in visible_segments:
             output_end = output_start + i1 - i0
             if seg.packed:
-                dequantized = self._dequant(seg.qk)
+                assert seg.packed_k is not None and seg.packed_v is not None
+                dequantized = self._dequant(seg.packed_k)
                 vk[:, output_start:output_end].copy_(dequantized[:, i0:i1])
                 del dequantized
 
-                dequantized = self._dequant(seg.qv)
+                dequantized = self._dequant(seg.packed_v)
                 vv[:, output_start:output_end].copy_(dequantized[:, i0:i1])
                 del dequantized
             else:
