@@ -12,6 +12,7 @@
 import importlib.util
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -182,6 +183,73 @@ class TestPackedStorageEquivalence(unittest.TestCase):
         self.assertTrue(torch.equal(view.k[:, :, 1:3, :], key))
         self.assertEqual(float(view.k[:, :, 0, :].abs().sum()), 0.0)
         self.assertEqual(float(view.k[:, :, 3, :].abs().sum()), 0.0)
+
+    def test_view_indices_and_debug_name(self):
+        cache = _packed(1, 8, 2, 4, sink=0, dev="cpu", quant=VARQKVQuantArgs())
+        key = torch.zeros(1, 4, 1, 4)
+        with self.assertRaisesRegex(ValueError, "VAR-Q packed KV cache"):
+            cache.update_and_get_attention_kv(key=key, value=key, current_chunk_start=0)
+        with self.assertRaisesRegex(ValueError, "custom VAR-Q"):
+            cache.update_and_get_attention_kv(
+                key=key,
+                value=key,
+                current_chunk_start=0,
+                debug_name="custom VAR-Q",
+            )
+        view = cache.update_and_get_attention_kv(
+            key=torch.zeros(1, 4, 2, 4),
+            value=torch.zeros(1, 4, 2, 4),
+            current_chunk_start=0,
+        )
+        self.assertEqual((view.local_start_index, view.local_end_index), (0, 4))
+        view = cache.update_and_get_attention_kv(
+            key=torch.ones(1, 4, 2, 4),
+            value=torch.ones(1, 4, 2, 4),
+            current_chunk_start=4,
+        )
+        self.assertEqual((view.local_start_index, view.local_end_index), (4, 8))
+        self.assertEqual((view.visible_local_end, view.visible_global_end), (8, 8))
+
+    def test_enabled_cpu_codec_layout_bytes_and_reset(self):
+        calls = []
+
+        def encode(tensor, **kwargs):
+            calls.append((tensor.shape, kwargs["kv_role"]))
+            return {
+                "packed": tensor.to(torch.int8),
+                "scale": torch.ones(1, 1, tensor.shape[2], tensor.shape[3]),
+                "pack_meta": None,
+                "quant_meta": {"qkv_format": "BLHc"},
+            }
+
+        def decode(packed, scale, pack_meta, quant_meta, dequant_dtype):
+            del scale, pack_meta, quant_meta
+            return packed.to(dequant_dtype)
+
+        args = VARQKVQuantArgs(
+            bits=4, keep_recent_chunks=0, sink=False, pack_to_int32=False
+        )
+        cache = _packed(1, 12, 2, 3, sink=0, dev="cpu", quant=args)
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.kvcache.varq_packed_cache._varq_functions",
+            return_value=(encode, decode),
+        ):
+            chunk = torch.arange(24, dtype=torch.float32).reshape(1, 4, 2, 3)
+            cache.update_and_get_attention_kv(
+                key=chunk, value=chunk, current_chunk_start=0
+            )
+            cache.update_and_get_attention_kv(
+                key=chunk, value=chunk, current_chunk_start=4
+            )
+
+        self.assertEqual(calls, [((1, 4, 2, 3), "k"), ((1, 4, 2, 3), "v")])
+        packed_bytes = 2 * (4 * 2 * 3 + 2 * 3 * 4)
+        current_bytes = 2 * chunk.numel() * chunk.element_size()
+        self.assertEqual(cache.resident_nbytes(), packed_bytes + current_bytes)
+        cache.pin_current_chunk(4)
+        cache.reset_indices()
+        self.assertEqual(cache.resident_nbytes(), 0)
+        self.assertEqual((cache._pinned_start, cache._pinned_len), (-1, 0))
 
     def test_host_index_cursors_reset_without_device_updates(self):
         cache = _packed(

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cache
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -34,6 +35,9 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
     CausalAttentionKVView,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.configs.quantization.varq_kv import VARQKVQuantArgs
 
 logger = init_logger(__name__)
 
@@ -90,8 +94,20 @@ def _packed_nbytes(packed: dict) -> int:
     return total
 
 
+def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for lo, hi in sorted((a, b) for a, b in intervals if b > a):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
 class QVGPackedCausalKVCache:
     """Chunk-segmented causal KV cache with PRQ-packed cold segments."""
+
+    _cache_label = "QVG"
 
     def __init__(
         self,
@@ -107,7 +123,7 @@ class QVGPackedCausalKVCache:
         use_int_indices: bool = False,
         sink_tokens: int = 0,
         attention_window_size: int | None = None,
-        quant_args: QVGKVQuantArgs,
+        quant_args: QVGKVQuantArgs | VARQKVQuantArgs,
     ) -> None:
         self.batch_size = batch_size
         self.cache_size = cache_size
@@ -130,12 +146,17 @@ class QVGPackedCausalKVCache:
         self._cur: _Segment | None = None  # current (mutable) chunk
         self._global_end = 0
         self._chunk_tokens = 0  # inferred from first advance
+        self._reset_extra_state()
+
+    def _reset_extra_state(self) -> None:
+        pass
 
     # ------------------------------------------------------------------ api
     def reset_indices(self) -> None:
         self._segments = []
         self._cur = None
         self._global_end = 0
+        self._reset_extra_state()
         if self.global_end_index_int is not None:
             self.global_end_index_int = 0
             self.local_end_index_int = 0
@@ -160,10 +181,18 @@ class QVGPackedCausalKVCache:
         )
 
     def resident_nbytes(self) -> int:
-        total = sum(s.nbytes() for s in self._segments)
+        total = sum(self._segment_nbytes(s) for s in self._segments)
         if self._cur is not None:
-            total += self._cur.nbytes()
+            total += self._segment_nbytes(self._cur)
         return total
+
+    def _segment_nbytes(self, seg: _Segment) -> int:
+        if seg.packed:
+            return self._packed_nbytes(seg.packed_k) + self._packed_nbytes(seg.packed_v)
+        return seg.nbytes()
+
+    def _packed_nbytes(self, packed: dict | None) -> int:
+        return _packed_nbytes(packed) if packed else 0
 
     # -------------------------------------------------------------- helpers
     def _new_bf16_segment(self, g0: int, g1: int, is_sink: bool) -> _Segment:
@@ -190,34 +219,41 @@ class QVGPackedCausalKVCache:
     def _pack(self, seg: _Segment) -> None:
         if seg.packed or seg.k is None:
             return
-        triton_prq_quantize_tensor, _ = _qvg_functions()
-
-        def q(x):
-            xb = x.permute(0, 2, 1, 3).contiguous()  # [B,S,H,D]->[B,H,S,D]
-            devices = [xb.device] if xb.is_cuda else []
-            with torch.random.fork_rng(devices=devices):
-                torch.manual_seed(1234)
-                return triton_prq_quantize_tensor(
-                    xb,
-                    num_stages=self.q.stages,
-                    num_clusters=self.q.centroids,
-                    block_size=self.q.block_size,
-                    max_iters=self.q.kmeans_iters,
-                    quantize_fn=lambda _t: self.q.bits,
-                    asymmetric=self.q.asymmetric,
-                )
-
-        seg.packed_k = q(seg.k)
-        seg.packed_v = q(seg.v)
+        seg.packed_k = self._pack_tensor(seg.k, "k")
+        seg.packed_v = self._pack_tensor(seg.v, "v")
         seg.k = None
         seg.v = None
-        logger.info_once(f"Using QVG packed KV cache: {self.q.describe()}")
+        logger.info_once(
+            f"Using {self._cache_label} packed KV cache: {self.q.describe()}"
+        )
+
+    def _pack_tensor(self, tensor: torch.Tensor, role: str) -> dict:
+        del role
+        triton_prq_quantize_tensor, _ = _qvg_functions()
+        q = cast(QVGKVQuantArgs, self.q)
+        xb = tensor.permute(0, 2, 1, 3).contiguous()
+        devices = [xb.device] if xb.is_cuda else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(1234)
+            return triton_prq_quantize_tensor(
+                xb,
+                num_stages=q.stages,
+                num_clusters=q.centroids,
+                block_size=q.block_size,
+                max_iters=q.kmeans_iters,
+                quantize_fn=lambda _t: q.bits,
+                asymmetric=q.asymmetric,
+            )
 
     def _dequant(self, packed: dict) -> torch.Tensor:
         _, triton_prq_dequantize_tensor = _qvg_functions()
+        q = cast(QVGKVQuantArgs, self.q)
         return triton_prq_dequantize_tensor(
-            packed, self.q.block_size, self.q.bits, output_dtype=self.dtype
+            packed, q.block_size, q.bits, output_dtype=self.dtype
         )  # [B,H,S,D]
+
+    def _decoded_slice(self, decoded: torch.Tensor, i0: int, i1: int) -> torch.Tensor:
+        return decoded[:, :, i0:i1].permute(0, 2, 1, 3)
 
     def _all_segments(self) -> list[_Segment]:
         segs = list(self._segments)
@@ -267,6 +303,27 @@ class QVGPackedCausalKVCache:
                     # once they are no longer the current recency-recent region
                     self._pack(s)
 
+    def _visible_ranges(
+        self, current_chunk_start: int, recent_window_tokens: int | None
+    ) -> list[tuple[int, int]]:
+        sink_end = self._sink_end()
+        if recent_window_tokens is None:
+            tail_start = self._tail_start()
+        else:
+            if recent_window_tokens < 0:
+                raise ValueError("recent_window_tokens must be >= 0 or None")
+            tail_start = max(sink_end, current_chunk_start - recent_window_tokens)
+        return (
+            [(0, self._global_end)]
+            if tail_start <= sink_end
+            else [(0, sink_end), (tail_start, self._global_end)]
+        )
+
+    def _view_indices(
+        self, visible_tokens: int, num_new_tokens: int
+    ) -> tuple[int, int]:
+        return 0, num_new_tokens
+
     # -------------------------------------------------------------- contract
     def update_and_get_attention_kv(
         self,
@@ -276,9 +333,11 @@ class QVGPackedCausalKVCache:
         current_chunk_start: int,
         cache_head_start: int | None = None,
         recent_window_tokens: int | None = None,
-        debug_name: str = "QVG packed KV cache",
+        debug_name: str | None = None,
     ) -> CausalAttentionKVView:
         num_new = key.shape[1]
+        if debug_name is None:
+            debug_name = f"{self._cache_label} packed KV cache"
         num_input_heads = key.shape[2]
         head_slice = None
         if num_input_heads != self.num_heads:
@@ -323,11 +382,12 @@ class QVGPackedCausalKVCache:
             self.local_end_index.fill_(local_end)
 
         vk, vv = self._reconstruct(current_chunk_start, recent_window_tokens)
+        local_start, local_end = self._view_indices(vk.shape[1], num_new)
         return CausalAttentionKVView(
             k=vk,
             v=vv,
-            local_start_index=0,
-            local_end_index=num_new,
+            local_start_index=local_start,
+            local_end_index=local_end,
             visible_local_end=min(self._global_end, self.cache_size),
             visible_global_end=self._global_end,
         )
@@ -339,18 +399,7 @@ class QVGPackedCausalKVCache:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Dense visible window = sink prefix ++ rolling recent tail, matching
         the dense cache's [sink | rolled-recent] buffer content."""
-        sink_end = self._sink_end()
-        if recent_window_tokens is None:
-            tail_start = self._tail_start()
-        else:
-            if recent_window_tokens < 0:
-                raise ValueError("recent_window_tokens must be >= 0 or None")
-            tail_start = max(sink_end, current_chunk_start - recent_window_tokens)
-
-        if tail_start <= sink_end:
-            ranges = [(0, self._global_end)]
-        else:
-            ranges = [(0, sink_end), (tail_start, self._global_end)]
+        ranges = self._visible_ranges(current_chunk_start, recent_window_tokens)
 
         visible_segments: list[tuple[_Segment, int, int]] = []
         visible_tokens = 0
@@ -384,13 +433,13 @@ class QVGPackedCausalKVCache:
             if seg.packed:
                 dequantized = self._dequant(seg.packed_k)
                 vk[:, output_start:output_end].copy_(
-                    dequantized[:, :, i0:i1].permute(0, 2, 1, 3)
+                    self._decoded_slice(dequantized, i0, i1)
                 )
                 del dequantized
 
                 dequantized = self._dequant(seg.packed_v)
                 vv[:, output_start:output_end].copy_(
-                    dequantized[:, :, i0:i1].permute(0, 2, 1, 3)
+                    self._decoded_slice(dequantized, i0, i1)
                 )
                 del dequantized
             else:
