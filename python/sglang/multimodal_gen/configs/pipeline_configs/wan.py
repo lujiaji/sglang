@@ -493,6 +493,23 @@ class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
     warp_denoising_step: bool = True
 
 
+@dataclass
+class CausalWanT2V480PConfig(WanT2V480PConfig):
+    """Causal chunked Wan T2V with a normal-length denoising schedule.
+
+    SelfForcingWanT2V480PConfig hardcodes [1000, 750, 500, 250] plus step warping,
+    which is only valid for distilled checkpoints; base Wan weights produce noise
+    under it. This variant keeps the causal stage (which requires an explicit step
+    list) but uses a uniform 20-step schedule with warping off.
+    """
+
+    is_causal: bool = True
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [1000 - 50 * i for i in range(20)]
+    )
+    warp_denoising_step: bool = False
+
+
 def _is_wan_animate_2_path(p: str) -> bool:
     # Registry probes are lower-cased. Require the "-2-"/"_2" token so a v1
     # Wan2.2-Animate-14B checkpoint (a different model / pipeline) does not route here.
@@ -509,6 +526,11 @@ def _is_wan_animate_2_distilled_path(p: str) -> bool:
 def register():
     from sglang.multimodal_gen.configs.sample.wan import (
         FastWanT2V480PConfig,
+    )
+    from sglang.multimodal_gen.configs.sample.wan import (
+        SelfForcingWanT2V480PConfig as SelfForcingWanT2V480P_SamplingParams,
+    )
+    from sglang.multimodal_gen.configs.sample.wan import (
         Turbo_Wan2_2_I2V_A14B_SamplingParam,
         Wan2_1_Fun_1_3B_InP_SamplingParams,
         Wan2_2_I2V_A14B_SamplingParam,
@@ -530,6 +552,19 @@ def register():
             "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         ],
         model_detectors=[lambda hf_id: "wanpipeline" in hf_id.lower()],
+    )
+    # Causal Self-Forcing runs the Wan 1.3B transformer through the causal DMD
+    # pipeline; select it from the pipeline class name in model_index.json.
+    register_configs(
+        sampling_param_cls=SelfForcingWanT2V480P_SamplingParams,
+        pipeline_config_cls=SelfForcingWanT2V480PConfig,
+        model_detectors=[lambda name: "wancausaldmdpipeline" in name.lower()],
+    )
+    # Causal Wan with base (non-distilled) weights: same causal path, normal steps.
+    register_configs(
+        sampling_param_cls=WanT2V_1_3B_SamplingParams,
+        pipeline_config_cls=CausalWanT2V480PConfig,
+        model_detectors=[lambda name: "causalwant2vpipeline" in name.lower()],
     )
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,

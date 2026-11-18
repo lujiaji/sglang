@@ -139,6 +139,32 @@ class TestPackedStorageEquivalence(unittest.TestCase):
     def test_recent_window_selection(self):
         self._run(rwt=16)
 
+    def test_view_indices_and_debug_name(self):
+        cache = _packed(1, 8, 2, 4, sink=0, dev="cpu", quant=QVGKVQuantArgs())
+        key = torch.zeros(1, 4, 1, 4)
+        with self.assertRaisesRegex(ValueError, "QVG packed KV cache"):
+            cache.update_and_get_attention_kv(key=key, value=key, current_chunk_start=0)
+        with self.assertRaisesRegex(ValueError, "custom QVG"):
+            cache.update_and_get_attention_kv(
+                key=key,
+                value=key,
+                current_chunk_start=0,
+                debug_name="custom QVG",
+            )
+        view = cache.update_and_get_attention_kv(
+            key=torch.zeros(1, 4, 2, 4),
+            value=torch.zeros(1, 4, 2, 4),
+            current_chunk_start=0,
+        )
+        self.assertEqual((view.local_start_index, view.local_end_index), (0, 4))
+        view = cache.update_and_get_attention_kv(
+            key=torch.ones(1, 4, 2, 4),
+            value=torch.ones(1, 4, 2, 4),
+            current_chunk_start=4,
+        )
+        self.assertEqual((view.local_start_index, view.local_end_index), (0, 4))
+        self.assertEqual((view.visible_local_end, view.visible_global_end), (8, 8))
+
     def test_host_index_cursors_reset_without_device_updates(self):
         cache = _packed(
             B=1,
