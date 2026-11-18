@@ -12,12 +12,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.layers.kvcache.qvg_packed_cache import (
-    QVGPackedCausalKVCache,
-)
-from sglang.multimodal_gen.runtime.layers.kvcache.varq_packed_cache import (
-    VARQPackedCausalKVCache,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
@@ -25,7 +19,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import
     CausalDMDDenoisingStage,
     CausalDMDForwardContext,
     CausalDMDRealtimeCacheContext,
-    CausalKVCache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -60,81 +53,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
     def _supports_varq_kv_cache_quantization(self) -> bool:
         return True
-
-    def _allocate_causal_kv_cache(
-        self,
-        *,
-        batch_size: int,
-        kv_cache_size: int,
-        num_attention_heads: int,
-        attention_head_dim: int,
-        dtype: torch.dtype,
-        device,
-        use_int_indices: bool = False,
-        sink_tokens: int = 0,
-        global_sink_tokens: int = 0,
-        attention_window_size: int | None = None,
-        allow_growth: bool = False,
-    ) -> list[CausalKVCache]:
-        varq_args = getattr(self, "_varq_quant_args", None)
-        varq_enabled = varq_args is not None and varq_args.enabled
-        if not self._kv_quant_args.enabled and not varq_enabled:
-            return super()._allocate_causal_kv_cache(
-                batch_size=batch_size,
-                kv_cache_size=kv_cache_size,
-                num_attention_heads=num_attention_heads,
-                attention_head_dim=attention_head_dim,
-                dtype=dtype,
-                device=device,
-                use_int_indices=use_int_indices,
-                sink_tokens=sink_tokens,
-                global_sink_tokens=global_sink_tokens,
-                attention_window_size=attention_window_size,
-                allow_growth=allow_growth,
-            )
-        if global_sink_tokens or allow_growth:
-            raise NotImplementedError(
-                "packed KV cache supports only the LingBot realtime "
-                "sliding-window and sink path"
-            )
-        if attention_window_size is None:
-            attention_window_size = kv_cache_size
-        if varq_enabled:
-            assert varq_args is not None  # narrowed by varq_enabled
-            return [
-                VARQPackedCausalKVCache(
-                    batch_size=batch_size,
-                    cache_size=kv_cache_size,
-                    num_heads=num_attention_heads,
-                    head_dim=attention_head_dim,
-                    dtype=dtype,
-                    device=device,
-                    use_int_indices=use_int_indices,
-                    global_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                    local_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                    sink_tokens=sink_tokens,
-                    attention_window_size=attention_window_size,
-                    quant_args=varq_args,
-                )
-                for _ in range(self.num_transformer_blocks)
-            ]
-        return [
-            QVGPackedCausalKVCache(
-                batch_size=batch_size,
-                cache_size=kv_cache_size,
-                num_heads=num_attention_heads,
-                head_dim=attention_head_dim,
-                dtype=dtype,
-                device=device,
-                use_int_indices=use_int_indices,
-                global_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                local_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                sink_tokens=sink_tokens,
-                attention_window_size=attention_window_size,
-                quant_args=self._kv_quant_args,
-            )
-            for _ in range(self.num_transformer_blocks)
-        ]
 
     def _lingbot_local_token_scale(self) -> int:
         """Rows this rank holds per N global rows: N for token-sharded, else 1."""

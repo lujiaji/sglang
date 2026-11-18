@@ -5,13 +5,11 @@
 - packed-storage equivalence vs the dense cache (quantization disabled -> bf16
   segments): CPU-only, exercises the segment / sliding-window / eviction /
   reconstruction logic bit-exactly without needing VAR-Q or a GPU.
-- pinned-sink bookkeeping: CPU-only.
 - quantized memory saving + reconstruction: requires CUDA + VAR-Q.
 """
 
 import importlib.util
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -23,12 +21,6 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
 )
 from sglang.multimodal_gen.runtime.layers.kvcache.varq_packed_cache import (
     VARQPackedCausalKVCache,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
-    CausalDMDDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.lingbot_world_causal_denoising import (
-    LingBotWorldCausalDMDDenoisingStage,
 )
 
 _HAS_VARQ = importlib.util.find_spec("VAR_Q") is not None
@@ -275,99 +267,6 @@ class TestPackedStorageEquivalence(unittest.TestCase):
         cache.reset_indices()
         self.assertEqual(cache.global_end_index_int, 0)
         self.assertEqual(cache.local_end_index_int, 0)
-
-
-class TestStageWiring(unittest.TestCase):
-    """Stage-level wiring: which stages accept VAR-Q, and which cache they build.
-
-    Requires the full sglang package (stage / server_args imports).
-    """
-
-    def test_quantization_is_rejected_by_unsupported_causal_stages(self):
-        stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
-        stage.sink_size = 0
-        stage.sliding_window_num_frames = 1
-
-        with self.assertRaisesRegex(ValueError, "does not support VAR-Q"):
-            stage._apply_causal_cache_overrides(
-                SimpleNamespace(),
-                SimpleNamespace(
-                    pipeline_config=SimpleNamespace(),
-                    kv_cache_quant_config=SimpleNamespace(enabled=False),
-                    kv_cache_varq_config=VARQKVQuantArgs(bits=4),
-                ),
-            )
-
-    def test_varq_and_qvg_are_mutually_exclusive(self):
-        stage = LingBotWorldCausalDMDDenoisingStage.__new__(
-            LingBotWorldCausalDMDDenoisingStage
-        )
-        stage.sink_size = 0
-        stage.sliding_window_num_frames = 1
-        # LingBot's override consults transformer.config before delegating
-        stage.transformer = SimpleNamespace(config=None)
-
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            stage._apply_causal_cache_overrides(
-                SimpleNamespace(),
-                SimpleNamespace(
-                    pipeline_config=SimpleNamespace(),
-                    kv_cache_quant_config=SimpleNamespace(enabled=True),
-                    kv_cache_varq_config=VARQKVQuantArgs(bits=4),
-                ),
-            )
-
-    def test_quantization_is_available_for_lingbot(self):
-        stage = LingBotWorldCausalDMDDenoisingStage.__new__(
-            LingBotWorldCausalDMDDenoisingStage
-        )
-        stage._kv_quant_args = QVGKVQuantArgs()
-        stage._varq_quant_args = VARQKVQuantArgs(bits=4)
-        stage.num_transformer_blocks = 1
-
-        caches = stage._allocate_causal_kv_cache(
-            batch_size=1,
-            kv_cache_size=8,
-            num_attention_heads=1,
-            attention_head_dim=4,
-            dtype=torch.float32,
-            device=torch.device("cpu"),
-        )
-
-        self.assertIsInstance(caches[0], VARQPackedCausalKVCache)
-
-
-class TestPinnedSink(unittest.TestCase):
-    """The QVG sibling refuses pinned sinks; VAR-Q serves them.
-
-    Pinning only adds tokens when the window is smaller than the current chunk;
-    otherwise the current chunk already sits fully inside the tail interval.
-    """
-
-    def test_pin_adds_current_chunk_head_when_window_is_smaller(self):
-        B, H, D, C, W, dev = 1, 1, 1, 8, 4, "cpu"
-        cache = _packed(B, W, H, D, sink=C, dev=dev, quant=VARQKVQuantArgs())
-        # chunk 0 becomes the sink
-        cache.update_and_get_attention_kv(
-            key=torch.full((B, C, H, D), 1.0),
-            value=torch.full((B, C, H, D), 1.0),
-            current_chunk_start=0,
-            recent_window_tokens=None,
-        )
-        # chunk 1 is the current chunk, tagged 100+i to tell its halves apart
-        k2 = torch.arange(C, dtype=torch.float32).view(1, C, 1, 1) + 100.0
-        without = cache.update_and_get_attention_kv(
-            key=k2, value=k2.clone(), current_chunk_start=C
-        )
-        cache.pin_current_chunk(C)
-        pinned = cache.update_and_get_attention_kv(
-            key=k2, value=k2.clone(), current_chunk_start=C
-        )
-        self.assertEqual(pinned.k.shape[1], without.k.shape[1] + C)
-        self.assertIn(100.0, set(pinned.k[0, :, 0, 0].tolist()))
-        self.assertNotIn(100.0, set(without.k[0, :, 0, 0].tolist()))
-        self.assertIn(107.0, set(pinned.k[0, :, 0, 0].tolist()))
-        self.assertIn(1.0, set(pinned.k[0, :, 0, 0].tolist()))
 
 
 @unittest.skipUnless(

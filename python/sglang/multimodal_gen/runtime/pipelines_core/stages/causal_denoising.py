@@ -1157,38 +1157,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
     ) -> list[CausalKVCache]:
         kv_quant_args = getattr(self, "_kv_quant_args", None)
         varq_args = getattr(self, "_varq_quant_args", None)
-        if kv_quant_args is None or varq_args is None:
-            # Some causal pipelines allocate the cache without going through
-            # _apply_causal_cache_overrides first; fall back to the process-wide
-            # args so a --kv-cache-varq/--kv-cache-quant request is not dropped.
-            try:
-                from sglang.multimodal_gen.runtime.server_args import (
-                    get_global_server_args,
-                )
-
-                _sa = get_global_server_args()
-            except Exception:
-                _sa = None
-            if _sa is not None:
-                if kv_quant_args is None:
-                    kv_quant_args = getattr(_sa, "kv_cache_quant_config", None)
-                if varq_args is None:
-                    varq_args = getattr(_sa, "kv_cache_varq_config", None)
         qvg_enabled = kv_quant_args is not None and kv_quant_args.enabled
         varq_enabled = varq_args is not None and varq_args.enabled
-        logger.info(
-            "Causal KV cache allocation: cache_size=%s window=%s sink=%s "
-            "global_sink=%s growth=%s qvg=%s varq=%s blocks=%s",
-            kv_cache_size,
-            attention_window_size,
-            sink_tokens,
-            global_sink_tokens,
-            allow_growth,
-            qvg_enabled,
-            varq_enabled,
-            self.num_transformer_blocks,
-        )
-
         if not qvg_enabled and not varq_enabled:
             if attention_window_size is None:
                 attention_window_size = kv_cache_size
@@ -1223,29 +1193,14 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )
         if attention_window_size is None:
             attention_window_size = kv_cache_size
-        if varq_enabled:
-            assert varq_args is not None  # narrowed by varq_enabled
-            return [
-                VARQPackedCausalKVCache(
-                    batch_size=batch_size,
-                    cache_size=kv_cache_size,
-                    num_heads=num_attention_heads,
-                    head_dim=attention_head_dim,
-                    dtype=dtype,
-                    device=device,
-                    use_int_indices=use_int_indices,
-                    global_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                    local_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                    sink_tokens=sink_tokens,
-                    attention_window_size=attention_window_size,
-                    quant_args=varq_args,
-                )
-                for _ in range(self.num_transformer_blocks)
-            ]
-
-        assert kv_quant_args is not None  # narrowed by qvg_enabled
-        return [
-            QVGPackedCausalKVCache(
+        cache_cls, quant_args = (
+            (VARQPackedCausalKVCache, varq_args)
+            if varq_enabled
+            else (QVGPackedCausalKVCache, kv_quant_args)
+        )
+        assert quant_args is not None  # narrowed by qvg_enabled / varq_enabled
+        caches: list[CausalKVCache] = [
+            cache_cls(
                 batch_size=batch_size,
                 cache_size=kv_cache_size,
                 num_heads=num_attention_heads,
@@ -1257,10 +1212,11 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 local_end_index=torch.zeros(1, dtype=torch.long, device=device),
                 sink_tokens=sink_tokens,
                 attention_window_size=attention_window_size,
-                quant_args=kv_quant_args,
+                quant_args=quant_args,
             )
             for _ in range(self.num_transformer_blocks)
         ]
+        return caches
 
     @torch.no_grad()
     def forward(
